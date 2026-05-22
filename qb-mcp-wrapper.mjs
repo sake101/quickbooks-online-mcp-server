@@ -23,7 +23,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY || !QB_CLIENT_ID || !QB_CLIENT_SECRET) {
 
 async function supabaseGet() {
   const res = await fetch(
-    `${SUPABASE_URL}/rest/v1/qb_tokens?select=access_token,refresh_token,realm_id,expires_at&order=updated_at.desc&limit=1`,
+    `${SUPABASE_URL}/rest/v1/qb_tokens?select=id,access_token,refresh_token,realm_id,expires_at&order=updated_at.desc&limit=1`,
     { headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` } }
   );
   const rows = await res.json();
@@ -51,15 +51,14 @@ async function edgeFunctionRefresh() {
 }
 
 async function supabaseUpsert(refreshToken, realmId) {
-  // Sync refresh token back via Edge Function so all consumers see it
-  const edgeRes = await edgeFunctionRefresh();
-  if (edgeRes) {
-    process.stderr.write('[qb-mcp-wrapper] Edge Function synced after MCP rotation\n');
+  // Read current row ID for targeted update (avoids PostgREST limit+PATCH ambiguity)
+  const row = await supabaseGet();
+  if (!row) {
+    process.stderr.write('[qb-mcp-wrapper] No token row to update\n');
     return;
   }
-  // Fallback: direct Supabase update
   const res = await fetch(
-    `${SUPABASE_URL}/rest/v1/qb_tokens?order=updated_at.desc&limit=1`,
+    `${SUPABASE_URL}/rest/v1/qb_tokens?id=eq.${row.id}`,
     {
       method: 'PATCH',
       headers: {
