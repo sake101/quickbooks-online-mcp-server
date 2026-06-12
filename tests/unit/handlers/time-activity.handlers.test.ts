@@ -141,10 +141,15 @@ describe('TimeActivity Handlers', () => {
         hours: 8,
         minutes: 30,
         description: 'Updated task',
-        billable_status: 'Billable'
+        billable_status: 'Billable',
+        item_ref: 'item-1'
       });
 
       expect(result.isError).toBe(false);
+      expect(mockQuickBooksInstance.updateTimeActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ ItemRef: { value: 'item-1' } }),
+        expect.any(Function)
+      );
     });
 
     it('should handle API errors', async () => {
