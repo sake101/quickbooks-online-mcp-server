@@ -49,6 +49,56 @@ describe('Report Handlers', () => {
       expect(result.isError).toBe(false);
     });
 
+    it('should pass end_date through to the QBO request and default start_date to end_date', async () => {
+      // QBO ignores end_date on BalanceSheet unless start_date is also sent —
+      // the handler must always pair them (see handler comment).
+      mockQuickBooksInstance.reportBalanceSheet.mockImplementation((params: any, cb: any) => cb(null, {}));
+
+      await getQuickbooksBalanceSheet({ end_date: '2026-05-31' });
+
+      expect(mockQuickBooksInstance.reportBalanceSheet).toHaveBeenCalledWith(
+        { start_date: '2026-05-31', end_date: '2026-05-31' },
+        expect.any(Function)
+      );
+    });
+
+    it('should preserve an explicit start_date alongside end_date', async () => {
+      mockQuickBooksInstance.reportBalanceSheet.mockImplementation((params: any, cb: any) => cb(null, {}));
+
+      await getQuickbooksBalanceSheet({
+        start_date: '2026-01-01',
+        end_date: '2026-05-31',
+        summarize_column_by: 'Month',
+      });
+
+      expect(mockQuickBooksInstance.reportBalanceSheet).toHaveBeenCalledWith(
+        { start_date: '2026-01-01', end_date: '2026-05-31', summarize_column_by: 'Month' },
+        expect.any(Function)
+      );
+    });
+
+    it('should pass start_date alone through unchanged', async () => {
+      mockQuickBooksInstance.reportBalanceSheet.mockImplementation((params: any, cb: any) => cb(null, {}));
+
+      await getQuickbooksBalanceSheet({ start_date: '2026-01-01' });
+
+      expect(mockQuickBooksInstance.reportBalanceSheet).toHaveBeenCalledWith(
+        { start_date: '2026-01-01' },
+        expect.any(Function)
+      );
+    });
+
+    it('should send no date params when none are provided', async () => {
+      mockQuickBooksInstance.reportBalanceSheet.mockImplementation((params: any, cb: any) => cb(null, {}));
+
+      await getQuickbooksBalanceSheet({ accounting_method: 'Cash' });
+
+      expect(mockQuickBooksInstance.reportBalanceSheet).toHaveBeenCalledWith(
+        { accounting_method: 'Cash' },
+        expect.any(Function)
+      );
+    });
+
     it('should handle errors', async () => {
       mockQuickBooksInstance.reportBalanceSheet.mockImplementation((params: any, cb: any) =>
         cb(new Error('Report failed'), null)
