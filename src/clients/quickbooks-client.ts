@@ -6,6 +6,13 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import open from 'open';
+import {
+  getSupabaseEnv,
+  refreshViaEdgeFunction,
+  pullRefreshTokenFromSupabase,
+  QboReauthRequiredError,
+  type SupabaseEnv,
+} from './supabase-token.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -225,10 +232,14 @@ class QuickbooksClient {
   private refreshInFlight?: Promise<{ access_token: string; expires_in: number }>;
 
   async refreshAccessToken() {
-    if (!this.refreshToken) {
-      await this.startOAuthFlow();
+    const supa = getSupabaseEnv();
 
-      // Verify we have a refresh token after OAuth flow
+    // The interactive OAuth browser flow is only meaningful for a standalone
+    // deployment with no Supabase authority. When Supabase IS configured the
+    // refresh token lives in the qb_tokens table / Edge Function, so a missing
+    // local token must never pop a browser — it would hang a headless MCP host.
+    if (!this.refreshToken && !supa) {
+      await this.startOAuthFlow();
       if (!this.refreshToken) {
         throw new Error('Failed to obtain refresh token from OAuth flow');
       }
@@ -240,55 +251,36 @@ class QuickbooksClient {
 
     this.refreshInFlight = (async () => {
       try {
-        // At this point we know refreshToken is not undefined
-        const authResponse = await this.oauthClient.refreshUsingToken(this.refreshToken!);
-
-        // The intuit-oauth type declarations are incomplete — the runtime
-        // token object also contains refresh_token, x_refresh_token_expires_in,
-        // token_type, realmId, etc. Widen the type to reach those fields.
-        const token = authResponse.token as unknown as {
-          access_token: string;
-          expires_in?: number;
-          refresh_token?: string;
-          x_refresh_token_expires_in?: number;
-        };
-
-        this.accessToken = token.access_token;
-
-        const expiresIn = token.expires_in || 3600;
-        this.accessTokenExpiry = new Date(Date.now() + expiresIn * 1000);
-
-        // Intuit rotates the refresh token (typically every ~24h). When a new
-        // one is issued we MUST persist it — the old value in .env becomes
-        // stale and will eventually stop working, silently breaking refresh.
-        const newRefreshToken = token.refresh_token;
-        if (newRefreshToken && newRefreshToken !== this.refreshToken) {
-          this.refreshToken = newRefreshToken;
+        // PRIMARY PATH: the Supabase Edge Function is the single serialized
+        // refresh authority shared by every QBO consumer. Going through it means
+        // this long-running process never refreshes with a token another
+        // consumer has already rotated out from under it — the historical cause
+        // of recurring `400 invalid_grant` errors that masqueraded as "needs a
+        // Command Center re-login". See supabase-token.ts for the full rationale.
+        if (supa) {
           try {
-            this.saveTokensToEnv();
-            console.error('[qbo-client] Refresh token rotated and persisted to .env');
-          } catch (persistErr) {
-            // Don't fail the whole refresh just because we couldn't write to
-            // disk; the in-memory token is still valid for this process.
-            console.error('[qbo-client] Failed to persist rotated refresh token:', persistErr);
+            const edge = await refreshViaEdgeFunction(supa);
+            this.accessToken = edge.accessToken;
+            if (edge.realmId) this.realmId = edge.realmId;
+            // The Edge Function does not return an exact expiry. A freshly minted
+            // token lasts ~60 min; a cached one is guaranteed ≥5 min of validity.
+            // Re-check well before either bound so we never present a dead token.
+            const ttlSec = edge.refreshed ? 50 * 60 : 4 * 60;
+            this.accessTokenExpiry = new Date(Date.now() + ttlSec * 1000);
+            return { access_token: this.accessToken, expires_in: ttlSec };
+          } catch (edgeErr) {
+            // A genuine dead refresh token is the only non-recoverable case —
+            // surface it so the human knows to reconnect. Everything else is
+            // transient: fall back to a direct Intuit refresh below.
+            if (edgeErr instanceof QboReauthRequiredError) throw edgeErr;
+            console.error(
+              '[qbo-client] Edge Function refresh failed, falling back to direct Intuit refresh:',
+              edgeErr instanceof Error ? edgeErr.message : edgeErr,
+            );
           }
         }
 
-        // Surface the refresh token's own remaining lifetime for observability.
-        // Intuit's refresh tokens last 100 days; warn when under 14 days.
-        const refreshExpiresIn = token.x_refresh_token_expires_in;
-        if (typeof refreshExpiresIn === 'number' && refreshExpiresIn < 14 * 24 * 3600) {
-          const days = Math.round(refreshExpiresIn / 86400);
-          console.error(`[qbo-client] WARNING: refresh token expires in ~${days} day(s). Re-run \`npm run auth\` before it expires.`);
-        }
-
-        return {
-          access_token: this.accessToken!,
-          expires_in: expiresIn,
-        };
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`Failed to refresh Quickbooks token: ${message}`);
+        return await this.refreshDirect(supa);
       } finally {
         this.refreshInFlight = undefined;
       }
@@ -297,10 +289,104 @@ class QuickbooksClient {
     return this.refreshInFlight;
   }
 
+  /**
+   * Fallback refresh straight against Intuit, used when Supabase is not
+   * configured or the Edge Function is transiently unreachable. Self-heals: if
+   * the refresh fails because our in-memory token was rotated out by another
+   * consumer, re-pull the authoritative token from Supabase and retry once.
+   */
+  private async refreshDirect(
+    supa: SupabaseEnv | null,
+  ): Promise<{ access_token: string; expires_in: number }> {
+    try {
+      return await this.doIntuitRefresh();
+    } catch (err) {
+      if (supa) {
+        try {
+          const latest = await pullRefreshTokenFromSupabase(supa);
+          if (latest && latest !== this.refreshToken) {
+            console.error(
+              '[qbo-client] Direct refresh failed; pulled newer refresh token from Supabase, retrying once',
+            );
+            this.refreshToken = latest;
+            return await this.doIntuitRefresh();
+          }
+        } catch (healErr) {
+          console.error(
+            '[qbo-client] Supabase self-heal lookup failed:',
+            healErr instanceof Error ? healErr.message : healErr,
+          );
+        }
+      }
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  /** One direct refresh attempt against Intuit using the in-memory refresh
+   *  token, persisting any rotation back to .env. */
+  private async doIntuitRefresh(): Promise<{ access_token: string; expires_in: number }> {
+    try {
+      // At this point we know refreshToken is not undefined
+      const authResponse = await this.oauthClient.refreshUsingToken(this.refreshToken!);
+
+      // The intuit-oauth type declarations are incomplete — the runtime
+      // token object also contains refresh_token, x_refresh_token_expires_in,
+      // token_type, realmId, etc. Widen the type to reach those fields.
+      const token = authResponse.token as unknown as {
+        access_token: string;
+        expires_in?: number;
+        refresh_token?: string;
+        x_refresh_token_expires_in?: number;
+      };
+
+      this.accessToken = token.access_token;
+
+      const expiresIn = token.expires_in || 3600;
+      this.accessTokenExpiry = new Date(Date.now() + expiresIn * 1000);
+
+      // Intuit rotates the refresh token (typically every ~24h). When a new
+      // one is issued we MUST persist it — the old value in .env becomes
+      // stale and will eventually stop working, silently breaking refresh.
+      const newRefreshToken = token.refresh_token;
+      if (newRefreshToken && newRefreshToken !== this.refreshToken) {
+        this.refreshToken = newRefreshToken;
+        try {
+          this.saveTokensToEnv();
+          console.error('[qbo-client] Refresh token rotated and persisted to .env');
+        } catch (persistErr) {
+          // Don't fail the whole refresh just because we couldn't write to
+          // disk; the in-memory token is still valid for this process.
+          console.error('[qbo-client] Failed to persist rotated refresh token:', persistErr);
+        }
+      }
+
+      // Surface the refresh token's own remaining lifetime for observability.
+      // Intuit's refresh tokens last 100 days; warn when under 14 days.
+      const refreshExpiresIn = token.x_refresh_token_expires_in;
+      if (typeof refreshExpiresIn === 'number' && refreshExpiresIn < 14 * 24 * 3600) {
+        const days = Math.round(refreshExpiresIn / 86400);
+        console.error(`[qbo-client] WARNING: refresh token expires in ~${days} day(s). Re-run \`npm run auth\` before it expires.`);
+      }
+
+      return {
+        access_token: this.accessToken!,
+        expires_in: expiresIn,
+      };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to refresh Quickbooks token: ${message}`);
+    }
+  }
+
   async authenticate() {
-    if (!this.refreshToken || !this.realmId) {
+    const supa = getSupabaseEnv();
+
+    // Only the standalone (no-Supabase) path needs local tokens up front; with
+    // Supabase configured, both the access token and realm_id come back from the
+    // Edge Function during refresh, so never trigger the interactive OAuth flow.
+    if ((!this.refreshToken || !this.realmId) && !supa) {
       await this.startOAuthFlow();
-      
+
       // Verify we have both tokens after OAuth flow
       if (!this.refreshToken || !this.realmId) {
         throw new Error('Failed to obtain required tokens from OAuth flow');
@@ -313,7 +399,12 @@ class QuickbooksClient {
       const tokenResponse = await this.refreshAccessToken();
       this.accessToken = tokenResponse.access_token;
     }
-    
+
+    // realm_id may only become known after the first refresh (Edge Function path).
+    if (!this.realmId) {
+      throw new Error('No realm_id available after token refresh');
+    }
+
     // At this point we know all tokens are available
     this.quickbooksInstance = new QuickBooks(
       this.clientId,
