@@ -4,7 +4,7 @@
 // this wrapper syncs changes back to Supabase so the daily agent stays in sync.
 
 import { spawn } from 'child_process';
-import { readFileSync, writeFileSync, watchFile, unwatchFile, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -47,35 +47,6 @@ async function edgeFunctionRefresh() {
     return res.json();
   } catch {
     return null;
-  }
-}
-
-async function supabaseUpsert(refreshToken, realmId) {
-  // Read current row ID for targeted update (avoids PostgREST limit+PATCH ambiguity)
-  const row = await supabaseGet();
-  if (!row) {
-    process.stderr.write('[qb-mcp-wrapper] No token row to update\n');
-    return;
-  }
-  const res = await fetch(
-    `${SUPABASE_URL}/rest/v1/qb_tokens?id=eq.${row.id}`,
-    {
-      method: 'PATCH',
-      headers: {
-        apikey: SUPABASE_KEY,
-        Authorization: `Bearer ${SUPABASE_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'return=minimal',
-      },
-      body: JSON.stringify({
-        refresh_token: refreshToken,
-        realm_id: realmId,
-        updated_at: new Date().toISOString(),
-      }),
-    }
-  );
-  if (!res.ok) {
-    process.stderr.write(`[qb-mcp-wrapper] Supabase upsert failed: ${res.status}\n`);
   }
 }
 
@@ -122,21 +93,8 @@ async function main() {
   writeEnvFile(tokens);
   process.stderr.write('[qb-mcp-wrapper] Synced tokens → .env\n');
 
-  let lastRefreshToken = tokens.refresh_token;
-
-  // Watch .env for token rotation by the MCP server
-  watchFile(ENV_PATH, { interval: 2000 }, async () => {
-    try {
-      const current = readEnvFile();
-      if (current?.QUICKBOOKS_REFRESH_TOKEN && current.QUICKBOOKS_REFRESH_TOKEN !== lastRefreshToken) {
-        lastRefreshToken = current.QUICKBOOKS_REFRESH_TOKEN;
-        await supabaseUpsert(current.QUICKBOOKS_REFRESH_TOKEN, current.QUICKBOOKS_REALM_ID);
-        process.stderr.write('[qb-mcp-wrapper] Rotated token synced back to Supabase\n');
-      }
-    } catch (e) {
-      process.stderr.write(`[qb-mcp-wrapper] Watch sync error: ${e.message}\n`);
-    }
-  });
+  // ponytail: no .env -> Supabase write-back. The MCP server refreshes only via the
+  // Edge Function now; blind PATCHes here orphaned the live token on 2026-11-17.
 
   // Launch the actual MCP server with stdio passthrough
   const child = spawn('node', [join(__dirname, 'dist', 'index.js')], {
@@ -149,18 +107,7 @@ async function main() {
     process.on(sig, () => child.kill(sig));
   }
 
-  child.on('exit', async (code) => {
-    unwatchFile(ENV_PATH);
-    // Final sync
-    try {
-      const current = readEnvFile();
-      if (current?.QUICKBOOKS_REFRESH_TOKEN && current.QUICKBOOKS_REFRESH_TOKEN !== tokens.refresh_token) {
-        await supabaseUpsert(current.QUICKBOOKS_REFRESH_TOKEN, current.QUICKBOOKS_REALM_ID);
-        process.stderr.write('[qb-mcp-wrapper] Final token sync to Supabase on exit\n');
-      }
-    } catch (e) {
-      process.stderr.write(`[qb-mcp-wrapper] Final sync error: ${e.message}\n`);
-    }
+  child.on('exit', (code) => {
     process.exit(code || 0);
   });
 }

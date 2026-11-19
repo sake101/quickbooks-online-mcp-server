@@ -9,7 +9,6 @@ import open from 'open';
 import {
   getSupabaseEnv,
   refreshViaEdgeFunction,
-  pullRefreshTokenFromSupabase,
   QboReauthRequiredError,
   type SupabaseEnv,
 } from './supabase-token.js';
@@ -313,28 +312,11 @@ export class QuickbooksClient {
       if (err instanceof QboReauthRequiredError) {
         throw err;
       }
-      // Any other (transient) Edge Function failure: fall back to a direct
-      // Intuit refresh that self-heals by re-pulling the authoritative token.
+      // ponytail: fail closed. A direct Intuit refresh here rotates the shared
+      // refresh token outside the Edge Function and orphans the stored one
+      // (QBO went dead 2026-11-17 that way). Transient errors retry next call.
       const message = err instanceof Error ? err.message : String(err);
-      console.error(`[qbo-client] Edge Function refresh failed (${message}); falling back to direct Intuit refresh`);
-      return await this.doIntuitRefreshWithSelfHeal(supa);
-    }
-  }
-
-  // Direct Intuit refresh with self-heal: if the refresh fails (commonly because
-  // our in-memory refresh token was rotated out by another consumer), re-pull
-  // the authoritative token from Supabase and retry once before giving up.
-  private async doIntuitRefreshWithSelfHeal(supa: SupabaseEnv): Promise<{ access_token: string; expires_in: number }> {
-    try {
-      return await this.doIntuitRefresh();
-    } catch (firstErr) {
-      const newer = await pullRefreshTokenFromSupabase(supa);
-      if (newer && newer !== this.refreshToken) {
-        console.error('[qbo-client] Retrying direct refresh with newer token from Supabase');
-        this.refreshToken = newer;
-        return await this.doIntuitRefresh();
-      }
-      throw firstErr;
+      throw new Error(`Edge Function refresh failed (${message}); not refreshing directly`);
     }
   }
 
