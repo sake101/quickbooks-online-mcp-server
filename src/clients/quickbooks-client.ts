@@ -279,6 +279,11 @@ export class QuickbooksClient {
         if (supa) {
           return await this.refreshViaSupabase(supa);
         }
+        // Production QBO's token belongs to the shared Supabase store; a direct refresh here would rotate it
+        // out from under every other consumer. Only sandbox may refresh on its own.
+        if (this.environment === 'production') {
+          throw new Error('SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not set: refusing a direct Intuit refresh of the shared production token');
+        }
         return await this.doIntuitRefresh();
       } finally {
         this.refreshInFlight = undefined;
