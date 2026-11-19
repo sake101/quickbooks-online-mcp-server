@@ -54,7 +54,7 @@ function writeEnvFile(tokens) {
   const lines = [
     `QUICKBOOKS_CLIENT_ID=${QB_CLIENT_ID}`,
     `QUICKBOOKS_CLIENT_SECRET=${QB_CLIENT_SECRET}`,
-    `QUICKBOOKS_REFRESH_TOKEN=${tokens.refresh_token}`,
+    // ponytail: no refresh token on disk. With SUPABASE_* set the server refreshes only via the Edge Function.
     `QUICKBOOKS_REALM_ID=${tokens.realm_id}`,
     `QUICKBOOKS_ENVIRONMENT=production`,
   ];
